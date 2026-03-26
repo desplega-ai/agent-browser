@@ -1285,6 +1285,37 @@ When enabled, agent-browser connects to a Kernel cloud session instead of launch
 
 Get your API key from the [Kernel Dashboard](https://dashboard.onkernel.com).
 
+### Desplega
+
+[Desplega](https://desplega.ai) provides cloud browser infrastructure for AI agents with CDP access for direct browser control.
+
+To enable Desplega, use the `-p` flag:
+
+```bash
+export DESPLEGA_API_KEY="your-api-key"
+agent-browser -p desplega open https://example.com
+```
+
+Or use environment variables for CI/scripts:
+
+```bash
+export AGENT_BROWSER_PROVIDER=desplega
+export DESPLEGA_API_KEY="your-api-key"
+agent-browser open https://example.com
+```
+
+Optional configuration via environment variables:
+
+| Variable           | Description                              | Default                    |
+| ------------------ | ---------------------------------------- | -------------------------- |
+| `DESPLEGA_API_URL` | API base URL (for custom deployments)    | `https://api.desplega.ai`  |
+
+When enabled, agent-browser connects to a Desplega cloud session instead of launching a local browser. All commands work identically.
+
+> **Note:** This provider requires the Desplega API to expose a `cdp_url` field in the session response. This capability is planned — check the [Desplega documentation](https://desplega.ai) for availability.
+
+Get your API key from the [Desplega Dashboard](https://app.desplega.ai).
+
 ## License
 
 Apache-2.0
