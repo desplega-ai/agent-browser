@@ -1,6 +1,6 @@
 //! Browser provider connections for remote CDP sessions.
 //!
-//! Supports Browserbase, Browserless, Browser Use, and Kernel providers.
+//! Supports Browserbase, Browserless, Browser Use, Kernel, and Desplega providers.
 //! Each provider returns a CDP WebSocket URL for connecting via BrowserManager.
 
 use serde_json::{json, Value};
@@ -22,8 +22,9 @@ pub async fn connect_provider(
         "browserless" => connect_browserless().await,
         "browser-use" | "browseruse" => connect_browser_use().await,
         "kernel" => connect_kernel().await,
+        "desplega" => connect_desplega().await,
         _ => Err(format!(
-            "Unknown provider '{}'. Supported: browserbase, browserless, browser-use, kernel",
+            "Unknown provider '{}'. Supported: browserbase, browserless, browser-use, kernel, desplega",
             provider_name
         )),
     }
@@ -73,6 +74,21 @@ pub async fn close_provider_session(session: &ProviderSession) {
                     .delete(format!(
                         "{}/browsers/{}",
                         endpoint.trim_end_matches('/'),
+                        session.session_id
+                    ))
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .send()
+                    .await;
+            }
+        }
+        "desplega" => {
+            if let Ok(api_key) = env::var("DESPLEGA_API_KEY") {
+                let api_url = env::var("DESPLEGA_API_URL")
+                    .unwrap_or_else(|_| "https://api.desplega.ai".to_string());
+                let _ = client
+                    .delete(format!(
+                        "{}/browsers/v1/sessions/{}",
+                        api_url.trim_end_matches('/'),
                         session.session_id
                     ))
                     .header("Authorization", format!("Bearer {}", api_key))
@@ -355,4 +371,174 @@ async fn connect_kernel() -> Result<(String, Option<ProviderSession>), String> {
             session_id,
         }),
     ))
+}
+
+/// Connects to a Desplega browser session and returns a CDP WebSocket URL.
+///
+/// **Note:** This provider depends on the Desplega API exposing a `cdp_url` field
+/// in the session response. This field is planned but may not yet be available.
+/// See: https://linear.app/desplega-labs/issue/DES-18
+///
+/// Environment variables:
+/// - `DESPLEGA_API_KEY` (required): Bearer token for authentication
+/// - `DESPLEGA_API_URL` (optional): API base URL, defaults to `https://api.desplega.ai`
+async fn connect_desplega() -> Result<(String, Option<ProviderSession>), String> {
+    let api_key = env::var("DESPLEGA_API_KEY")
+        .map_err(|_| "DESPLEGA_API_KEY environment variable is not set")?;
+
+    let api_url = env::var("DESPLEGA_API_URL")
+        .unwrap_or_else(|_| "https://api.desplega.ai".to_string());
+    let base_url = format!("{}/browsers/v1/sessions", api_url.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+
+    // Create a new browser session
+    let response = client
+        .post(&base_url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&json!({ "headless": true }))
+        .send()
+        .await
+        .map_err(|e| format!("Desplega request failed: {}", e))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Desplega response: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "Desplega API error ({}): {}",
+            status.as_u16(),
+            body
+        ));
+    }
+
+    let json: Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid Desplega response: {}", e))?;
+
+    let session_id = json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Desplega response missing session id".to_string())?
+        .to_string();
+
+    // Helper to clean up the session on error paths, preventing orphaned sessions
+    // on the Desplega backend.
+    let cleanup_session = |client: &reqwest::Client, base_url: &str, session_id: &str, api_key: &str| {
+        let url = format!("{}/{}", base_url, session_id);
+        let auth = format!("Bearer {}", api_key);
+        let client = client.clone();
+        async move {
+            let _ = client
+                .delete(&url)
+                .header("Authorization", auth)
+                .send()
+                .await;
+        }
+    };
+
+    // Sessions start as "starting" — poll until "active"
+    let session_url = format!("{}/{}", base_url, session_id);
+    let max_attempts = 30;
+    let poll_interval = std::time::Duration::from_secs(2);
+
+    for attempt in 1..=max_attempts {
+        let poll_response = match client
+            .get(&session_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                cleanup_session(&client, &base_url, &session_id, &api_key).await;
+                return Err(format!("Desplega poll request failed: {}", e));
+            }
+        };
+
+        let poll_status = poll_response.status();
+        let poll_body = match poll_response.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                cleanup_session(&client, &base_url, &session_id, &api_key).await;
+                return Err(format!("Failed to read Desplega poll response: {}", e));
+            }
+        };
+
+        if !poll_status.is_success() {
+            cleanup_session(&client, &base_url, &session_id, &api_key).await;
+            return Err(format!(
+                "Desplega API error while polling ({}): {}",
+                poll_status.as_u16(),
+                poll_body
+            ));
+        }
+
+        let poll_json: Value = match serde_json::from_str(&poll_body) {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_session(&client, &base_url, &session_id, &api_key).await;
+                return Err(format!("Invalid Desplega poll response: {}", e));
+            }
+        };
+
+        let session_status = poll_json
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        match session_status {
+            "active" => {
+                // NOTE: The `cdp_url` field is expected to be added to the Desplega API
+                // session response. If this field is missing, the API needs to be updated.
+                let ws_url = match poll_json.get("cdp_url").and_then(|v| v.as_str()) {
+                    Some(url) => url.to_string(),
+                    None => {
+                        cleanup_session(&client, &base_url, &session_id, &api_key).await;
+                        return Err(
+                            "Desplega session is active but response missing cdp_url. \
+                             The Desplega API may not yet expose CDP URLs."
+                                .to_string(),
+                        );
+                    }
+                };
+
+                return Ok((
+                    ws_url,
+                    Some(ProviderSession {
+                        provider: "desplega".to_string(),
+                        session_id,
+                    }),
+                ));
+            }
+            "failed" => {
+                let error_msg = poll_json
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                cleanup_session(&client, &base_url, &session_id, &api_key).await;
+                return Err(format!("Desplega session failed: {}", error_msg));
+            }
+            "starting" => {
+                if attempt == max_attempts {
+                    cleanup_session(&client, &base_url, &session_id, &api_key).await;
+                    return Err(format!(
+                        "Desplega session did not become active after {} attempts",
+                        max_attempts
+                    ));
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+            other => {
+                cleanup_session(&client, &base_url, &session_id, &api_key).await;
+                return Err(format!("Unexpected Desplega session status: {}", other));
+            }
+        }
+    }
+
+    // unreachable: all loop iterations return
+    Err("Desplega session polling exhausted".to_string())
 }
